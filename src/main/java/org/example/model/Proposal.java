@@ -17,4 +17,8 @@ public class Proposal {
     private String value;
     private String commitment;
 
+    @ManyToOne
+    @JoinColumn(name = "node_id")
+    private Node node;
+
 }

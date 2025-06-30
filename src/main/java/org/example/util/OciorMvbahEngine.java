@@ -1,7 +1,9 @@
 package org.example.util;
 
 import com.backblaze.erasure.ReedSolomon;
+import org.example.model.Node;
 import org.example.model.Proposal;
+import org.example.respository.NodeRepository;
 import org.example.respository.ProposalRepository;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Configuration;
@@ -15,15 +17,23 @@ public class OciorMvbahEngine {
 
     @Autowired
     private ProposalRepository proposalRepository;
-    int id;
     int messageLength;
 
-    static final int N = 5, T = 1;
+    static int N = 5;
+    static final int T = 1;
 
     Set<String> allCommitments = new HashSet<>();
 
     Map<String, Map<Integer, byte[]>> confirmed = new HashMap<>();
 
+    Map<Integer, byte[][]> S_shares = new HashMap<>();
+    Map<Integer, Integer> L_lock = new HashMap<>();
+    Map<Integer, Integer> R_ready = new HashMap<>();
+    Map<Integer, Integer> F_finish = new HashMap<>();
+    Map<Integer, String> H_hash = new HashMap<>();
+
+    @Autowired
+    private NodeRepository nodeRepository;
 
     byte[] DRh(String C) throws Exception {
         Map<Integer, byte[]> shares = confirmed.get(C);
@@ -38,12 +48,29 @@ public class OciorMvbahEngine {
     }
 
 
-    int ABBBA(Proposal proposal) {
-        return Integer.parseInt(proposal.getValue());
+    int ABBBA(Proposal proposal, List<Proposal> proposals) {
+        int quorum = (2 * T) + 1;
+        long zeros, ones;
+        zeros=proposals.stream().filter(proposal1 -> proposal1.getValue().equalsIgnoreCase("0")).count();
+        ones=proposals.stream().filter(proposal1 -> proposal1.getValue().equalsIgnoreCase("1")).count();
+        if (proposal.getValue().equalsIgnoreCase("0") && zeros >= quorum) {
+            return 0;
+        }
+       else if (proposal.getValue().equalsIgnoreCase("1") && ones >= quorum) {
+            return 1;
+        }
+       return -1;
     }
 
     int ABBA(int a) {
-        return a; // simulate confirmation
+        if (a == 0 || a == 1) {
+            return a; // quorum reached → keep decided value
+        } else {
+            // Fallback: use common coin when undecided
+            int coin = new java.util.Random().nextBoolean() ? 1 : 0;
+            System.out.printf("⚖️ ABBA: no quorum → using common coin: %d%n", coin);
+            return coin;
+        }
     }
 
 
@@ -89,18 +116,27 @@ public class OciorMvbahEngine {
     }
 
     public String mvbahRound(List<Proposal> proposals) throws Exception {
+        List<Node> nodes=nodeRepository.findAll();
+        if(!nodes.isEmpty()){
+            N=nodes.size();
+        }
         // 1) load proposals into confirmed commitments like Node.receiveShare() does
         for (Proposal p : proposals) {
+            initNodeStates(N);
             byte[] value = p.getValue().getBytes();
             byte[][] shares = encodeMessageWithReedSolomon(value);
+            Integer nodeId = p.getNode().getId().intValue();
+
             String C = p.getCommitment();
             // simulate collecting t+1 shares (in real life, you'd get shares from network)
             Map<Integer, byte[]> dummyShares = new HashMap<>();
             for (int i = 0; i < T + 1; i++) {
                 dummyShares.put(i, shares[i]);
+                S_shares.get(nodeId)[i] = shares[i];
             }
             confirmed.put(C, dummyShares);
             allCommitments.add(C);
+            H_hash.put(nodeId, p.getCommitment());
         }
 
         // 2) run the same election → ABBBA → ABBA → DRh → Predicate logic
@@ -109,7 +145,7 @@ public class OciorMvbahEngine {
         for (String C : allCommitments) {
             List<Proposal> proposalList = proposalRepository.findByCommitment(C);
             for (Proposal proposal : proposalList) {
-                int a = ABBBA(proposal);
+                int a = ABBBA(proposal, proposalList);
                 int b = ABBA(a);
                 if (b == 1 || b == 0) {
                     messageLength = proposalList.get(0).getValue().length();
@@ -117,6 +153,8 @@ public class OciorMvbahEngine {
                     if (predicate(val)) {
                         String sVal = new String(val);
                         valueCounts.put(sVal, valueCounts.getOrDefault(sVal, 0) + 1);
+                        R_ready.put(proposal.getNode().getId().intValue(), 1);
+                        L_lock.put(proposal.getNode().getId().intValue(), 1);
                     }
                 }
             }
@@ -128,9 +166,24 @@ public class OciorMvbahEngine {
             if (entry.getValue() >= majorityThreshold) {
                 return entry.getKey();
             }
+//            for (int nodeId = 1; true; nodeId++) {
+//                if (R_ready.getOrDefault(nodeId, 0) == 1) {
+//                    F_finish.put(nodeId, 1); // ✅ node has finished
+//                }
+//            }
         }
+        return "⊥";
+    }
 
-        return "⊥"; // No majority found
+
+    void initNodeStates(int n) {
+        for (int j = 1; j <= n; j++) {
+            S_shares.put(j, new byte[][]{null, null, null});
+            L_lock.put(j, 0);
+            R_ready.put(j, 0);
+            F_finish.put(j, 0);
+            H_hash.put(j, null);
+        }
     }
 
 }
