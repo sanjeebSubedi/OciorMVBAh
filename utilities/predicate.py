@@ -1,4 +1,4 @@
-def predicate(w: str) -> bool:
+async def predicate(w: str) -> bool:
     return w.startswith("value_from_")
 
 
