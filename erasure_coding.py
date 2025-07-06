@@ -1,38 +1,120 @@
+# rebuilt RS helper — any t+1 of n shares reconstruct
+from typing import Dict, List
+
 import reedsolo
 
-
-def erasure_encode(n: int, t: int, input_value) -> list:
-    """MVBA Reed-Solomon encoding: n shares, any t+1 can reconstruct"""
-    k = t + 1  # Minimum shares needed for reconstruction
-
-    # Convert to bytes
-    data = input_value.encode("utf-8") if isinstance(input_value, str) else input_value
-
-    # Encode with Reed-Solomon
-    rs = reedsolo.RSCodec(n - k)
-    encoded = rs.encode(data)
-
-    # Split into n shares
-    share_size = len(encoded) // n
-    shares = [encoded[i * share_size : (i + 1) * share_size] for i in range(n)]
-    return shares
+# ---------- Galois-field helpers (exposed by reedsolo) ----------
+gf_mul = reedsolo.gf_mul
+gf_inv = reedsolo.gf_inverse
 
 
-def erasure_decode(n: int, t: int, shares: dict):
-    """MVBA Reed-Solomon decoding from available shares"""
+def _vandermonde(n: int, k: int) -> List[List[int]]:
+    """n × k Vandermonde matrix over GF(256) evaluated at points 1…n"""
+    return [[pow(i, j, 257) for j in range(k)] for i in range(1, n + 1)]
+
+
+def _matrix_invert_gf256(matrix: List[List[int]]) -> List[List[int]]:
+    """
+    Invert a square matrix over GF(256) using Gaussian elimination.
+    """
+    n = len(matrix)
+    # Create augmented matrix [A | I]
+    aug = []
+    for i in range(n):
+        row = matrix[i][:] + [0] * n  # copy row and append zeros
+        row[n + i] = 1  # identity matrix
+        aug.append(row)
+
+    # Forward elimination
+    for i in range(n):
+        # Find pivot (non-zero element)
+        pivot_row = i
+        for j in range(i + 1, n):
+            if aug[j][i] != 0:
+                pivot_row = j
+                break
+
+        if aug[pivot_row][i] == 0:
+            raise ValueError("Matrix is not invertible")
+
+        # Swap rows if needed
+        if pivot_row != i:
+            aug[i], aug[pivot_row] = aug[pivot_row], aug[i]
+
+        # Scale row to make pivot = 1
+        pivot = aug[i][i]
+        pivot_inv = gf_inv(pivot)
+        for j in range(2 * n):
+            aug[i][j] = gf_mul(aug[i][j], pivot_inv)
+
+        # Eliminate column
+        for j in range(n):
+            if i != j and aug[j][i] != 0:
+                factor = aug[j][i]
+                for k in range(2 * n):
+                    aug[j][k] ^= gf_mul(factor, aug[i][k])
+
+    # Extract inverse matrix from right half
+    inverse = []
+    for i in range(n):
+        inverse.append(aug[i][n:])
+
+    return inverse
+
+
+# =================================================================
+#                           public API
+# =================================================================
+def erasure_encode(n: int, t: int, value) -> List[bytes]:
+    """
+    Return *n* Reed-Solomon shares; **any** (t+1) are enough to decode.
+    """
     k = t + 1
+    data = value.encode() if isinstance(value, str) else bytes(value)
 
-    # Reconstruct encoded data
-    share_size = len(next(iter(shares.values())))
-    encoded = bytearray(share_size * n)
+    # pad so len(data) is a multiple of k
+    if len(data) % k:
+        data += b"\x00" * (k - len(data) % k)
 
-    for idx, share in shares.items():
-        encoded[idx * share_size : (idx + 1) * share_size] = share
+    blocks = [data[i : i + k] for i in range(0, len(data), k)]
+    V = _vandermonde(n, k)  # constant for (n,k)
 
-    # Decode
-    rs = reedsolo.RSCodec(n - k)
-    return rs.decode(bytes(encoded))
+    shares = [bytearray() for _ in range(n)]
+    for blk in blocks:
+        for row, out in zip(V, shares):
+            acc = 0
+            for coef, byte in zip(row, blk):
+                acc ^= gf_mul(coef, byte)
+            out.append(acc)
+
+    return [bytes(s) for s in shares]
 
 
-if __name__ == "__main__":
-    print(erasure_encode(4, 1, "input_fromx_1"))
+def erasure_decode(n: int, t: int, shares: Dict[int, bytes]) -> bytes:
+    """
+    Reconstruct original bytes from ≥ t+1 *indexed* shares.
+    `shares` is a dict {index (0-based) → share-bytes}.
+    """
+    k = t + 1
+    if len(shares) < k:
+        raise ValueError("need at least t+1 shares to decode")
+
+    share_len = len(next(iter(shares.values())))
+    if any(len(s) != share_len for s in shares.values()):
+        raise ValueError("all shares must be equal length")
+
+    idxs = sorted(shares)[:k]  # pick first k indices
+    V = _vandermonde(n, k)
+    M = [[V[i][j] for j in range(k)] for i in idxs]  # k×k sub-matrix
+    Minv = _matrix_invert_gf256(M)
+
+    out = bytearray()
+    for pos in range(share_len):
+        col = [shares[i][pos] for i in idxs]
+        for row in Minv:
+            acc = 0
+            for a, b in zip(row, col):
+                acc ^= gf_mul(a, b)
+            out.append(acc)
+
+    return bytes(out).rstrip(b"\x00")  # strip padding
