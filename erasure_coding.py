@@ -9,22 +9,9 @@ gf_inv = reedsolo.gf_inverse
 
 
 def _vandermonde(n: int, k: int, node_id: int = 0) -> List[List[int]]:
-    """n × k Vandermonde matrix with node-specific offset using proper GF(256) arithmetic"""
+    """n × k Vandermonde matrix with node-specific offset"""
     offset = node_id + 1  # ensure uniqueness
-    result = []
-    for i in range(1, n + 1):
-        row = []
-        base = (i + offset) % 256  # Keep in GF(256)
-        if base == 0:  # 0 is not a generator, use 1 instead
-            base = 1
-
-        current = 1  # base^0 = 1
-        for j in range(k):
-            row.append(current)
-            if j < k - 1:  # Don't compute one extra
-                current = gf_mul(current, base)  # Proper GF(256) multiplication
-        result.append(row)
-    return result
+    return [[pow(i + offset, j, 257) for j in range(k)] for i in range(1, n + 1)]
 
 
 def _matrix_invert_gf256(matrix: List[List[int]]) -> List[List[int]]:
