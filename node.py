@@ -12,8 +12,10 @@ Usage: python node.py [--server-port PORT] [--input VALUE]
 """
 
 import argparse
+import hashlib
 import json
 import logging
+import secrets
 import signal
 import socket
 import sys
@@ -52,12 +54,16 @@ class MessageType(Enum):
     ELECTION = "ELECTION"
     CONFIRM = "CONFIRM"
 
+    COIN_COMMIT = "COIN_COMMIT"
+    COIN_REVEAL = "COIN_REVEAL"
+
     # DRh protocol messages
     ECHOSHARE = "ECHOSHARE"
 
     # Internal messages
     HEARTBEAT = "HEARTBEAT"
     SHUTDOWN = "SHUTDOWN"
+    INPUT_READY = "INPUT_READY"
 
 
 @dataclass
@@ -132,19 +138,24 @@ class ZeroMQManager:
 
             # Set up DEALER sockets for sending to peers
             for peer in self.peers:
-                peer_id = peer["node_id"]
+                # Bootstrap delivers IDs as strings ("0", "1", ...).
+                # Keep *both* forms so the rest of the code (which uses ints)
+                # and ZeroMQ (which uses the original strings) work seamlessly.
+                peer_id_str = peer["node_id"]  # "2"
+                peer_id_int = int(peer_id_str)
                 peer_port = peer["zmq_port"]
                 peer_address = peer["address"]
 
                 dealer = self.context.socket(zmq.DEALER)
                 dealer.setsockopt(zmq.IDENTITY, str(self.node_id).encode())
-
-                # Connect to peer
                 dealer.connect(f"tcp://{peer_address}:{peer_port}")
-                self.dealer_sockets[peer_id] = dealer
+
+                # Store under both key types
+                self.dealer_sockets[peer_id_int] = dealer
+                self.dealer_sockets[peer_id_str] = dealer
 
                 self.logger.info(
-                    f"Connected to peer {peer_id} on {peer_address}:{peer_port}"
+                    f"Connected to peer {peer_id_int} on {peer_address}:{peer_port}"
                 )
 
             return True
@@ -157,8 +168,15 @@ class ZeroMQManager:
         """Send message to specific node"""
         try:
             if target_node_id not in self.dealer_sockets:
-                self.logger.error(f"No connection to node {target_node_id}")
-                return False
+                alt_id = (
+                    str(target_node_id)
+                    if isinstance(target_node_id, int)
+                    else int(target_node_id)
+                )
+                if alt_id not in self.dealer_sockets:
+                    self.logger.error(f"No connection to node {target_node_id}")
+                    return False
+                target_node_id = alt_id
 
             socket = self.dealer_sockets[target_node_id]
             socket.send_string(message.to_json())
@@ -261,6 +279,7 @@ class MVBANode:
         self.input_value: Optional[str] = None
         self.protocol_started = False
         self.initialize_state()
+        self.buffered_messages = []
 
         # MVBA protocol state (will be expanded)
         self.protocol_state = {
@@ -274,6 +293,18 @@ class MVBANode:
         # Setup signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+
+        self.input_ready = False
+        self.nodes_ready = set()
+        self.all_nodes_ready = False
+        self.sync_complete = False
+
+        self.current_round = 1  # r starts at 1
+        self.election_started = False
+        self.coin_commit = {}  # {r: {node_id: H_j}}
+        self.coin_reveal = {}  # {r: {node_id: s_j_hex}}
+        self.coin_ready = {}  # {r: True when coin decided}
+        self.leader_round = {}  # {r: l}
 
     def initialize_state(self):
         self.acidh_locks = {}
@@ -393,6 +424,8 @@ class MVBANode:
         # Route message to appropriate handler
         if message.msg_type == MessageType.HEARTBEAT:
             self._handle_heartbeat(message)
+        elif message.msg_type == MessageType.INPUT_READY:
+            self._handle_input_ready(message)
         elif message.msg_type in [
             MessageType.SHARE,
             MessageType.VOTE,
@@ -400,11 +433,31 @@ class MVBANode:
             MessageType.READY,
             MessageType.FINISH,
         ]:
-            self._handle_acid_message(message)
-        elif message.msg_type in [MessageType.ELECTION, MessageType.CONFIRM]:
-            self._handle_election_message(message)
-        elif message.msg_type == MessageType.ECHOSHARE:
-            self._handle_dr_message(message)
+            if self.sync_complete:
+                self._handle_acid_message(message)
+            else:
+                if not hasattr(self, "buffered_messages"):
+                    self.buffered_messages = []
+                self.buffered_messages.append(message)
+
+        elif message.msg_type in [MessageType.ELECTION]:
+            if self.sync_complete:
+                self._handle_election_message(message)
+            else:
+                self.logger.debug(
+                    f"Buffering {message.msg_type.value} until sync complete"
+                )
+                self.buffered_messages.append(message)
+        elif message.msg_type == MessageType.CONFIRM:
+            if self.sync_complete:
+                self._handle_confirm_message(message)
+            else:
+                self.logger.debug(
+                    f"Buffering {message.msg_type.value} until sync complete"
+                )
+                self.buffered_messages.append(message)
+        elif message.msg_type in [MessageType.COIN_COMMIT, MessageType.COIN_REVEAL]:
+            self._handle_coin_message(message)
         else:
             self.logger.warning(f"Unknown message type: {message.msg_type}")
 
@@ -412,6 +465,16 @@ class MVBANode:
         """Handle heartbeat messages"""
         self.logger.debug(f"Heartbeat from node {message.sender_id}")
         # Could add peer liveness tracking here
+
+    def _handle_input_ready(self, message: MVBAMessage):
+        """Handle INPUT_READY messages from other nodes"""
+        sender_id = message.sender_id
+
+        if sender_id not in self.nodes_ready:
+            self.nodes_ready.add(sender_id)
+            self.logger.info(
+                f"📝 Node {sender_id} reported ready ({len(self.nodes_ready)}/{self.total_nodes})"
+            )
 
     def _handle_acid_message(self, message: MVBAMessage):
         """Handle ACIDh protocol messages"""
@@ -424,6 +487,12 @@ class MVBANode:
             self._handle_share_message(message)
         elif message.msg_type == MessageType.VOTE:
             self._handle_vote_message(message)
+        elif message.msg_type == MessageType.LOCK:
+            self._handle_lock_message(message)
+        elif message.msg_type == MessageType.READY:
+            self._handle_ready_message(message)
+        elif message.msg_type == MessageType.FINISH:
+            self._handle_finish_message(message)
 
     def _extract_bytes_from_string(self, shard_str: str) -> bytes:
         """Convert string representation back to bytes"""
@@ -479,8 +548,10 @@ class MVBANode:
             self.logger.info(f"✅ Share verification successful for node {j}")
 
             # Line 13: Store share data
+            if C not in self.acidh_hash:
+                self.acidh_hash[C] = j
+
             self.acidh_shares[j] = (C, y, omega)
-            self.acidh_hash[C] = j
 
             # Send VOTE message (Algorithm 9, line 14)
             self._send_vote_message(C)
@@ -513,13 +584,13 @@ class MVBANode:
         threshold = self.total_nodes - self.byzantine_threshold
 
         for commitment, voters in self.vote_counts.items():
-            if len(voters) >= threshold and commitment in self.Hhash:
+            if len(voters) >= threshold and commitment in self.acidh_hash:
                 # We have enough votes and the commitment is known
-                j_star = self.Hhash[commitment]
+                j_star = self.acidh_hash[commitment]
 
-                if j_star not in self.Llock or self.Llock[j_star] != 1:
+                if j_star not in self.acidh_locks or self.acidh_locks[j_star] != 1:
                     # Haven't locked this yet
-                    self.Llock[j_star] = 1
+                    self.acidh_locks[j_star] = 1
                     self.logger.info(f"🔒 Locked proposal from node {j_star} (delayed)")
                     self._send_lock_message(commitment)
 
@@ -566,17 +637,23 @@ class MVBANode:
             if commitment in self.acidh_hash:
                 # Line 17: j⋆ ← Hhash[C]; Llock[j⋆] ← 1
                 j_star = self.acidh_hash[commitment]
-                self.acidh_locks[j_star] = 1
+                if self.acidh_locks.get(j_star, 0) != 1:
+                    self.acidh_locks[j_star] = 1
 
-                self.logger.info(
-                    f"🔒 Locked proposal from node {j_star} (commitment {commitment[:16]}...)"
-                )
+                    self.logger.info(
+                        f"🔒 Locked proposal from node {j_star} (commitment {commitment[:16]}...)"
+                    )
 
-                # Line 18: send ("LOCK",ID, C) to all nodes
-                self._send_lock_message(commitment)
+                    # Line 18: send ("LOCK",ID, C) to all nodes
+                    self._send_lock_message(commitment)
 
-                # Prevent processing this commitment again
-                self.vote_counts[commitment] = set()  # Clear to prevent reprocessing
+                    # Prevent processing this commitment again
+                    # Clear to prevent reprocessing
+                else:
+                    self.logger.debug(
+                        f"💤 Proposal from node {j_star} already locked, ignoring additional votes"
+                    )
+                self.vote_counts[commitment] = set()
 
             else:
                 # Commitment not in Hhash yet - we need to wait
@@ -585,13 +662,371 @@ class MVBANode:
                     f"⏳ Have enough votes for {commitment[:16]}... but waiting for SHARE"
                 )
 
-    def _handle_election_message(self, message: MVBAMessage):
-        """Handle election protocol messages"""
-        # Placeholder for election protocol implementation
-        self.logger.info(
-            f"Election: {message.msg_type.value} from node {message.sender_id}"
+    def _send_ready_message(self, commitment: str):
+        ready_msg = MVBAMessage(
+            msg_type=MessageType.READY,
+            sender_id=self.node_id,
+            session_id=self.session_id,
+            protocol_id="ready",
+            data={"commitment": commitment},
         )
-        # TODO: Implement election protocol logic
+        self.zmq_manager.broadcast_message(ready_msg)
+        self.logger.info(f"📤 Sent READY for commitment {commitment[:16]}...")
+
+    def _handle_lock_message(self, message: MVBAMessage):
+        """
+        ACID-Ready Phase (Algorithm 9, lines 19–22):
+        upon receiving n−t ("LOCK",ID,C) from distinct nodes:
+            wait until C ∈ acidh_hash
+            j⋆ ← acidh_hash[C]; Rready[j⋆] ← 1
+            send ("READY",ID,C) to all nodes
+        """
+        sender_id = message.sender_id
+        commitment = message.data["commitment"]
+
+        self.logger.debug(
+            f"🔐 Received LOCK from node {sender_id} for commitment {commitment[:16]}..."
+        )
+
+        # initialize lock_counts map if needed
+        if not hasattr(self, "lock_counts"):
+            self.lock_counts = {}  # commitment → set of sender IDs
+
+        if commitment not in self.lock_counts:
+            self.lock_counts[commitment] = set()
+        self.lock_counts[commitment].add(sender_id)
+        lock_count = len(self.lock_counts[commitment])
+        threshold = self.total_nodes - self.byzantine_threshold  # n - t
+
+        if lock_count >= threshold:
+            # Ensure we know the SHARE first (Alg 9 line 20)
+            if commitment in self.acidh_hash:
+                j_star = self.acidh_hash[commitment]
+
+                # Mark Rready[j⋆] ← 1  (initialized in initialize_state)
+                self.acidh_ready[j_star] = 1
+
+                if not hasattr(self, "ready_sent"):
+                    self.ready_sent = set()
+                if commitment not in self.ready_sent:
+                    self.ready_sent.add(commitment)
+                    self._send_ready_message(commitment)
+
+                self.logger.info(
+                    f"✅ Ready to deliver proposal from node {j_star} (commitment {commitment[:16]}...)"
+                )
+
+                # Broadcast READY only once
+                # if not hasattr(self, "ready_sent"):
+                #     self.ready_sent = set()
+                # self.ready_sent.add(commitment)
+
+                # self._send_ready_message(commitment)
+
+                # Clear lock counts to avoid re-processing
+                self.lock_counts[commitment] = set()
+            else:
+                # We have locks but not the share yet – keep waiting
+                self.logger.debug(
+                    f"⏳ Have {lock_count}/{threshold} LOCKs for {commitment[:16]}..., waiting for SHARE"
+                )
+
+    def _send_finish_message(self, target_node_id: int, commitment: str):
+        """Alg-9 line 26: send FINISH(ID) to P_{j⋆}."""
+        finish_msg = MVBAMessage(
+            msg_type=MessageType.FINISH,
+            sender_id=self.node_id,
+            session_id=self.session_id,
+            protocol_id="finish",
+            data={"commitment": commitment},
+        )
+
+        # NEW: local delivery when target == self  ↓↓↓
+        if target_node_id == self.node_id:
+            self._handle_acid_message(finish_msg)  # deliver directly
+        else:
+            self.zmq_manager.send_message(target_node_id, finish_msg)
+
+        self.logger.info(
+            f"📤 Sent FINISH for commitment {commitment[:16]}... to node {target_node_id}"
+        )
+
+    def _handle_ready_message(self, message: MVBAMessage):
+        """
+        ACID-finish phase (Algorithm 9 lines 23-26):
+
+        23  upon receiving n−t ("READY",ID,C) from distinct nodes, for the same C do
+        24      wait until C ∈ Hhash
+        25      j⋆ ← Hhash[C];  Ffinish[j⋆] ← 1
+        26      send ("FINISH",ID) to Pj⋆
+        """
+        sender_id = message.sender_id
+        commitment = message.data["commitment"]
+
+        self.logger.debug(
+            f"📨 READY from node {sender_id} for commitment {commitment[:16]}..."
+        )
+
+        # Track READYs per commitment
+        if not hasattr(self, "ready_counts"):
+            self.ready_counts: Dict[str, set] = {}
+
+        if commitment not in self.ready_counts:
+            self.ready_counts[commitment] = set()
+        self.ready_counts[commitment].add(sender_id)
+
+        ready_cnt = len(self.ready_counts[commitment])
+        threshold = self.total_nodes - self.byzantine_threshold  # n − t
+
+        if ready_cnt >= threshold:
+            # Ensure the SHARE for this commitment is already known (Alg 9 line 24)
+            if commitment in self.acidh_hash:
+                j_star = self.acidh_hash[commitment]
+
+                # Already finished for j⋆ ?
+                if self.acidh_finish.get(j_star, 0) == 1:
+                    return
+
+                # Line 25: mark Ffinish[j⋆] ← 1
+                self.acidh_finish[j_star] = 1
+                self.logger.info(
+                    f"🏁 FINISH conditions met for proposal of node {j_star} "
+                    f"(commitment {commitment[:16]}...)"
+                )
+
+                # Line 26: send FINISH to Pj⋆   (only once per commitment)
+                if not hasattr(self, "finish_sent"):
+                    self.finish_sent = set()
+                if commitment not in self.finish_sent:
+                    self.finish_sent.add(commitment)
+                    self._send_finish_message(j_star, commitment)
+
+                # clear to avoid re-trigger
+                self.ready_counts[commitment] = set()
+            else:
+                # SHARE not seen yet; wait
+                self.logger.debug(
+                    f"⏳ {ready_cnt}/{threshold} READY for {commitment[:16]}..., "
+                    f"waiting for SHARE"
+                )
+
+    def _send_election_message(self, commitment: str):
+        """Broadcast ELECTION once ACID[(ID,j)] is finished"""
+        election_msg = MVBAMessage(
+            msg_type=MessageType.ELECTION,
+            sender_id=self.node_id,
+            session_id=self.session_id,
+            protocol_id="election",
+            data={"commitment": commitment},
+        )
+        self._handle_election_message(election_msg)
+        self.zmq_manager.broadcast_message(election_msg)
+        self.logger.info(f"📤 Sent ELECTION for commitment {commitment[:16]}...")
+
+    def _handle_finish_message(self, message: MVBAMessage):
+        """
+        Algorithm 9, lines 27-28
+         27 upon receiving n−t ("FINISH",ID) from distinct nodes do
+         28     send ("ELECTION",ID) to all nodes
+        """
+        sender_id = message.sender_id
+        commitment = message.data["commitment"]
+
+        self.logger.debug(
+            f"🏁 FINISH from node {sender_id} for commitment {commitment[:16]}..."
+        )
+
+        # Track FINISH messages per commitment
+        if not hasattr(self, "finish_counts"):
+            self.finish_counts: Dict[str, set] = {}
+
+        if commitment not in self.finish_counts:
+            self.finish_counts[commitment] = set()
+        self.finish_counts[commitment].add(sender_id)
+
+        finish_cnt = len(self.finish_counts[commitment])
+        threshold = self.total_nodes - self.byzantine_threshold  # n − t
+
+        # Already sent ELECTION for this commitment?
+        if hasattr(self, "election_sent") and commitment in self.election_sent:
+            return
+
+        if finish_cnt >= threshold:
+            # Broadcast ELECTION exactly once
+            if not hasattr(self, "election_sent"):
+                self.election_sent = set()
+            self.election_sent.add(commitment)
+            self._send_election_message(commitment)
+
+            # Clear to avoid re-trigger
+            self.finish_counts[commitment] = set()
+
+    def _handle_election_message(self, message: MVBAMessage):
+        sender_id = message.sender_id
+        commitment = message.data["commitment"]  # kept only for logging
+
+        self.logger.info(f"Election: ELECTION from node {sender_id}")
+
+        # Track senders globally (per-ID, not per-commitment)
+        if not hasattr(self, "election_senders"):
+            self.election_senders: set[int] = set()
+
+        self.election_senders.add(sender_id)
+
+        # n − t distinct nodes trigger first CONFIRM
+        if len(self.election_senders) >= self.total_nodes - self.byzantine_threshold:
+            if not getattr(self, "confirm_already_sent", False):
+                self.confirm_already_sent = True
+                # any commitment is fine – use our own if we have it
+                chosen_C = getattr(self, "vc_commit", commitment)
+                self._send_confirm_message(chosen_C)
+
+    def _send_confirm_message(self, commitment: str):
+        """Broadcast CONFIRM once (we also process it locally)."""
+        confirm_msg = MVBAMessage(
+            msg_type=MessageType.CONFIRM,
+            sender_id=self.node_id,
+            session_id=self.session_id,
+            protocol_id="confirm",
+            data={"commitment": commitment},
+        )
+
+        # Process our own CONFIRM first so our vote counts
+        self._handle_confirm_message(confirm_msg)
+
+        # Then broadcast to peers
+        self.zmq_manager.broadcast_message(confirm_msg)
+        self.logger.info(f"📤 Sent CONFIRM for commitment {commitment[:16]}...")
+
+    def _handle_confirm_message(self, message: MVBAMessage):
+        sender_id = message.sender_id
+        commitment = message.data["commitment"]
+
+        self.logger.debug(f"CONFIRM from node {sender_id}")
+
+        if not hasattr(self, "confirm_senders"):
+            self.confirm_senders: set[int] = set()
+
+        # store once per node
+        self.confirm_senders.add(sender_id)
+
+        t = self.byzantine_threshold
+
+        # Amplify phase – send CONFIRM after t+1 distinct confirmations
+        if len(self.confirm_senders) >= t + 1 and not getattr(
+            self, "confirm_already_sent", False
+        ):
+            self.confirm_already_sent = True
+            self._send_confirm_message(commitment)
+
+        # Termination: 2t + 1 confirmations
+        if len(self.confirm_senders) >= 2 * t + 1:
+            self.logger.info("✅ CONFIRM phase complete – ready for DRh / decision.")
+
+            if not self.election_started:
+                self._start_election_round()
+
+    def _broadcast_coin_commit(self, r: int, commit_hex: str):
+        msg = MVBAMessage(
+            msg_type=MessageType.COIN_COMMIT,
+            sender_id=self.node_id,
+            session_id=self.session_id,
+            protocol_id=f"coin_commit_round_{r}",
+            data={"round": r, "commit": commit_hex},
+        )
+        self.zmq_manager.broadcast_message(msg)
+
+    def _broadcast_coin_reveal(self, r: int, share_hex: str):
+        msg = MVBAMessage(
+            msg_type=MessageType.COIN_REVEAL,
+            sender_id=self.node_id,
+            session_id=self.session_id,
+            protocol_id=f"coin_reveal_round_{r}",
+            data={"round": r, "share": share_hex},
+        )
+        self.zmq_manager.broadcast_message(msg)
+
+    # ---- round bootstrap -------------------------------------------------
+    def _start_election_round(self):
+        if self.election_started:
+            return
+        self.election_started = True
+
+        r = self.current_round
+        # generate local random share s_i
+        s_bytes = secrets.token_bytes(32)
+        s_hex = s_bytes.hex()
+        H_hex = hashlib.sha256(s_bytes).hexdigest()
+
+        # record our own commit immediately
+        self.coin_commit.setdefault(r, {})[self.node_id] = H_hex
+
+        self.logger.info(f"🔑 [Round {r}] Broadcasting COIN_COMMIT")
+        self._broadcast_coin_commit(r, H_hex)
+
+        # store share for later reveal
+        self._my_coin_share = (r, s_hex)
+
+    # ---- message dispatcher ---------------------------------------------
+    def _handle_coin_message(self, msg: MVBAMessage):
+        if msg.msg_type == MessageType.COIN_COMMIT:
+            self._handle_coin_commit(msg)
+        else:
+            self._handle_coin_reveal(msg)
+
+    # ---- commit ----------------------------------------------------------
+    def _handle_coin_commit(self, msg: MVBAMessage):
+        r = msg.data["round"]
+        H = msg.data["commit"]
+
+        self.coin_commit.setdefault(r, {})[msg.sender_id] = H
+
+        threshold = self.total_nodes - self.byzantine_threshold
+        if len(
+            self.coin_commit[r]
+        ) >= threshold and self.node_id not in self.coin_reveal.get(r, {}):
+            # reveal our own share now
+            if hasattr(self, "_my_coin_share") and self._my_coin_share[0] == r:
+                _, s_hex = self._my_coin_share
+                self.coin_reveal.setdefault(r, {})[self.node_id] = s_hex
+                self.logger.info(f"🔑 [Round {r}] Broadcasting COIN_REVEAL")
+                self._broadcast_coin_reveal(r, s_hex)
+
+    # ---- reveal & coin decision -----------------------------------------
+    def _handle_coin_reveal(self, msg: MVBAMessage):
+        r = msg.data["round"]
+        s_hex = msg.data["share"]
+
+        # need matching commit
+        commit_dict = self.coin_commit.get(r, {})
+        if msg.sender_id not in commit_dict:
+            return  # commit not seen yet, ignore for now
+
+        H_expected = commit_dict[msg.sender_id]
+        if hashlib.sha256(bytes.fromhex(s_hex)).hexdigest() != H_expected:
+            return  # invalid reveal
+
+        self.coin_reveal.setdefault(r, {})[msg.sender_id] = s_hex
+
+        threshold = self.total_nodes - self.byzantine_threshold
+        if len(self.coin_reveal[r]) >= threshold:  # ≥ n−t reveals
+            # deterministic ordering → identical hash everywhere
+            sorted_ids = sorted(self.coin_reveal[r])
+            concat = b"".join(
+                bytes.fromhex(self.coin_reveal[r][sid]) for sid in sorted_ids
+            )
+            coin_val = int.from_bytes(hashlib.sha256(concat).digest(), "big")
+            l = coin_val % self.total_nodes
+
+            prev = self.leader_round.get(r)
+            if prev != l:  # only log if it changed
+                self.leader_round[r] = l
+                self.logger.info(
+                    f"🎲 [Round {r}] Common coin -> leader {l}"
+                    + (" (updated)" if prev is not None else "")
+                )
+            self.coin_ready[r] = True
+            # TODO: invoke ABBBA / ABBA in next step
 
     def _handle_dr_message(self, message: MVBAMessage):
         """Handle data retrieval protocol messages"""
@@ -620,7 +1055,7 @@ class MVBANode:
         self.input_value = value
         self.logger.info(f"Input value set to: {value}")
 
-    def start_mvba_protocol(self):
+    def start_communication(self):
         """Start the MVBA protocol with the set input value"""
 
         if self.protocol_started:
@@ -635,6 +1070,47 @@ class MVBANode:
             else:
                 print("Input rejected by the predicate. Try again.")
 
+        self.input_ready = True
+        self._broadcast_input_ready()
+        self.nodes_ready.add(self.node_id)
+
+        # Wait for all nodes to be ready
+        self._wait_for_all_nodes_ready()
+        return True
+
+    def _broadcast_input_ready(self):
+        """Broadcast that this node has input ready"""
+        ready_msg = MVBAMessage(
+            msg_type=MessageType.INPUT_READY,
+            sender_id=self.node_id,
+            session_id=self.session_id,
+            protocol_id="sync",
+            data={"node_id": self.node_id},
+        )
+
+        self.zmq_manager.broadcast_message(ready_msg)
+
+    def _wait_for_all_nodes_ready(self):
+        """Wait until all nodes have reported ready"""
+        while not self.all_nodes_ready:
+            time.sleep(0.5)  # Check every 500ms
+
+            # Check if we have all nodes ready
+            if len(self.nodes_ready) == self.total_nodes:
+                self.all_nodes_ready = True
+                print(f"[Node {self.node_id}] 🚀 All nodes ready! Starting protocol...")
+                self._start_mvba_protocol()
+                break
+
+    def _start_mvba_protocol(self):
+        """Actually start the protocol once all nodes are ready"""
+
+        "\n === MVBA Protocol STARTED ==== \n"
+
+        if self.sync_complete:
+            return
+
+        self.sync_complete = True
         self.protocol_started = True
         self.shards = erasure_encode(
             self.total_nodes, self.byzantine_threshold, self.input_value
@@ -659,13 +1135,66 @@ class MVBANode:
                 },
             )
             self.zmq_manager.send_message(peer_id, message)
-        # exit()
 
-        return True
+        shard, proof = vc_open(self.shards, self.node_id)
+        self_message = MVBAMessage(
+            msg_type=MessageType.SHARE,
+            sender_id=self.node_id,
+            session_id=self.session_id,
+            protocol_id="share",
+            data={
+                "shard": str(shard),
+                "commitment": self.vc_commit,
+                "proof": proof,
+                "peer_id": self.node_id,
+            },
+        )
+        # Process self-SHARE immediately
+        self._handle_acid_message(self_message)
+        print(f"[Node {self.node_id}] 📤 Sent SHARE messages to all peers")
+
+        if hasattr(self, "buffered_messages") and self.buffered_messages:
+            # Sort messages: SHARE first, then VOTE, then others
+            share_messages = [
+                msg
+                for msg in self.buffered_messages
+                if msg.msg_type == MessageType.SHARE
+            ]
+            vote_messages = [
+                msg
+                for msg in self.buffered_messages
+                if msg.msg_type == MessageType.VOTE
+            ]
+            other_messages = [
+                msg
+                for msg in self.buffered_messages
+                if msg.msg_type not in [MessageType.SHARE, MessageType.VOTE]
+            ]
+
+            all_ordered_messages = share_messages + vote_messages + other_messages
+
+            self.logger.info(
+                f"Processing {len(all_ordered_messages)} buffered messages ({len(share_messages)} SHARE, {len(vote_messages)} VOTE)"
+            )
+
+            for msg in all_ordered_messages:
+                if msg.msg_type in [
+                    MessageType.SHARE,
+                    MessageType.VOTE,
+                    MessageType.LOCK,
+                    MessageType.READY,
+                    MessageType.FINISH,
+                ]:
+                    self._handle_acid_message(msg)
+                elif msg.msg_type in [MessageType.ELECTION, MessageType.CONFIRM]:
+                    self._handle_election_message(msg)
+                elif msg.msg_type == MessageType.ECHOSHARE:
+                    self._handle_dr_message(msg)
+
+            self.buffered_messages.clear()
 
     def run(self):
         """Main run loop for the node"""
-        print("\n\n\n")
         self.running = True
 
         try:
@@ -675,9 +1204,9 @@ class MVBANode:
                     self._send_heartbeat()
 
                 # Check if we should start the protocol (for demo purposes)
-                if not self.protocol_started:
-                    time.sleep(2)  # Give time for all nodes to connect
-                    self.start_mvba_protocol()
+                if not self.input_ready and not self.protocol_started:
+                    time.sleep(1)  # Give time for all nodes to connect
+                    self.start_communication()
 
                 time.sleep(5)  # Heartbeat interval
 
