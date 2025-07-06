@@ -12,4 +12,6 @@ public interface ProposalRepository extends JpaRepository<Proposal, Long> {
 
     List<Proposal> findByCommitment(String commitment);
 
+    List<Proposal> findByNodeId(Long nodeId);
+
 }

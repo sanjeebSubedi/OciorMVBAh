@@ -95,7 +95,7 @@ public class OciorMvbahEngine {
         for (int i = 0; i < OciorMvbahEngine.T; i++) result.write(shards[i]);
         return result.toByteArray();
     }
-    byte[][] encodeMessageWithReedSolomon(byte[] data) {
+   static byte[][] encodeMessageWithReedSolomon(byte[] data) {
         int shardSize = (data.length + T - 1) / T; // minimum to cover data
 
         // Total data + parity shards
@@ -149,12 +149,12 @@ public class OciorMvbahEngine {
                 int b = ABBA(a);
                 if (b == 1 || b == 0) {
                     messageLength = proposalList.get(0).getValue().length();
-                    byte[] val = DRh(C);
-                    if (predicate(val)) {
-                        String sVal = new String(val);
-                        valueCounts.put(sVal, valueCounts.getOrDefault(sVal, 0) + 1);
-                        R_ready.put(proposal.getNode().getId().intValue(), 1);
-                        L_lock.put(proposal.getNode().getId().intValue(), 1);
+                        byte[] val = DRh(C);
+                        if (predicate(val)) {
+                            String sVal = new String(val);
+                            valueCounts.put(sVal, valueCounts.getOrDefault(sVal, 0) + 1);
+                            R_ready.put(proposal.getNode().getId().intValue(), 1);
+                            L_lock.put(proposal.getNode().getId().intValue(), 1);
                     }
                 }
             }
