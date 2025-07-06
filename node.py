@@ -65,6 +65,16 @@ class MessageType(Enum):
     SHUTDOWN = "SHUTDOWN"
     INPUT_READY = "INPUT_READY"
 
+    # --- ABBBA (biased BA) ---
+    ABBBA_PREVOTE = "ABBBA_PREVOTE"
+    ABBBA_VOTE = "ABBBA_VOTE"
+    ABBBA_DECIDE = "ABBBA_DECIDE"
+
+    # --- ABBA (un-biased BA) ---
+    ABBA_PREVOTE = "ABBA_PREVOTE"
+    ABBA_VOTE = "ABBA_VOTE"
+    ABBA_DECIDE = "ABBA_DECIDE"
+
 
 @dataclass
 class MVBAMessage:
@@ -306,6 +316,11 @@ class MVBANode:
         self.coin_ready = {}  # {r: True when coin decided}
         self.leader_round = {}  # {r: l}
 
+        # ------------- ABBBA / ABBA -------------
+        self.abbba_state = {}  # key = leader l  →  dict with local data
+        self.abba_state = {}  # key = leader l  →  dict with local data
+        self.mvba_decided = False
+
     def initialize_state(self):
         self.acidh_locks = {}
         self.acidh_ready = {}
@@ -458,6 +473,20 @@ class MVBANode:
                 self.buffered_messages.append(message)
         elif message.msg_type in [MessageType.COIN_COMMIT, MessageType.COIN_REVEAL]:
             self._handle_coin_message(message)
+
+        # -------- ABBBA / ABBA ------------------------------------------------
+        elif message.msg_type in [
+            MessageType.ABBBA_PREVOTE,
+            MessageType.ABBBA_VOTE,
+            MessageType.ABBBA_DECIDE,
+        ]:
+            self._handle_abbba_message(message)
+        elif message.msg_type in [
+            MessageType.ABBA_PREVOTE,
+            MessageType.ABBA_VOTE,
+            MessageType.ABBA_DECIDE,
+        ]:
+            self._handle_abba_message(message)
         else:
             self.logger.warning(f"Unknown message type: {message.msg_type}")
 
@@ -1026,7 +1055,200 @@ class MVBANode:
                     + (" (updated)" if prev is not None else "")
                 )
             self.coin_ready[r] = True
+            if l not in self.abbba_state:
+                self._start_abbba_instance(l)
             # TODO: invoke ABBBA / ABBA in next step
+
+    def _start_abbba_instance(self, leader_id: int):
+        """
+        Spawn ABBBA(ID, leader_id) with inputs
+            a1 = Rready[leader_id] ,  a2 = Ffinish[leader_id]
+        """
+        a1 = self.acidh_ready.get(leader_id, 0)
+        a2 = self.acidh_finish.get(leader_id, 0)
+
+        st = {
+            "a1": a1,
+            "a2": a2,
+            "prevotes": {},  # node_id → (a1,a2)
+            "votes": {},  # node_id → bit
+            "decided": None,
+        }
+        self.abbba_state[leader_id] = st
+
+        # Broadcast PREVOTE
+        msg = MVBAMessage(
+            msg_type=MessageType.ABBBA_PREVOTE,
+            sender_id=self.node_id,
+            session_id=self.session_id,
+            protocol_id=f"abbba_prev_{leader_id}",
+            data={
+                "leader": leader_id,
+                "a1": a1,
+                "a2": a2,
+            },
+        )
+        self._handle_abbba_message(msg)  # local delivery
+        self.zmq_manager.broadcast_message(msg)
+        self.logger.info(f"🔄 ABBBA[{leader_id}] PREVOTE (a1={a1},a2={a2}) sent")
+
+    # ---------------- handlers -----------------
+    def _handle_abbba_message(self, msg: MVBAMessage):
+        l = msg.data["leader"]
+        st = self.abbba_state.setdefault(
+            l, {"a1": 0, "a2": 0, "prevotes": {}, "votes": {}, "decided": None}
+        )
+
+        if msg.msg_type == MessageType.ABBBA_PREVOTE:
+            st["prevotes"][msg.sender_id] = (msg.data["a1"], msg.data["a2"])
+
+            # When we have n-t PREVOTEs we compute our VOTE
+            if (
+                len(st["prevotes"]) >= self.total_nodes - self.byzantine_threshold
+                and self.node_id not in st["votes"]
+            ):
+
+                # Decision rule (simple version):
+                has_a2 = any(a2 for (_, a2) in st["prevotes"].values())
+                a1_count = sum(a1 for (a1, _) in st["prevotes"].values())
+                bit = 1 if has_a2 or a1_count >= self.byzantine_threshold + 1 else 0
+
+                st["votes"][self.node_id] = bit
+
+                vote_msg = MVBAMessage(
+                    msg_type=MessageType.ABBBA_VOTE,
+                    sender_id=self.node_id,
+                    session_id=self.session_id,
+                    protocol_id=f"abbba_vote_{l}",
+                    data={"leader": l, "bit": bit},
+                )
+                self._handle_abbba_message(vote_msg)
+                self.zmq_manager.broadcast_message(vote_msg)
+                self.logger.info(f"🔄 ABBBA[{l}] VOTE({bit}) broadcast")
+
+        elif msg.msg_type == MessageType.ABBBA_VOTE:
+            bit = msg.data["bit"]
+            st["votes"][msg.sender_id] = bit
+
+            # Decide when n-t identical votes received
+            threshold = self.total_nodes - self.byzantine_threshold
+            for b in (0, 1):
+                if (
+                    list(st["votes"].values()).count(b) >= threshold
+                    and st["decided"] is None
+                ):
+                    st["decided"] = b
+
+                    decide_msg = MVBAMessage(
+                        msg_type=MessageType.ABBBA_DECIDE,
+                        sender_id=self.node_id,
+                        session_id=self.session_id,
+                        protocol_id=f"abbba_decide_{l}",
+                        data={"leader": l, "bit": b},
+                    )
+                    self._handle_abbba_message(decide_msg)
+                    self.logger.info(f"✅ ABBBA[{l}] decided {b}")
+
+                    # Start ABBA with input = b
+                    self._start_abba_instance(l, b)
+
+        elif msg.msg_type == MessageType.ABBBA_DECIDE:
+            # (Not used – we decide locally and immediately continue to ABBA)
+            pass
+
+    # ------------------------------------------------------------------ #
+    #                    -------  ABBA (un-biased) -------               #
+    # ------------------------------------------------------------------ #
+    def _start_abba_instance(self, leader_id: int, input_bit: int):
+        if self.mvba_decided:
+            return
+
+        st = {
+            "input": input_bit,
+            "prevotes": {self.node_id: input_bit},
+            "votes": {},
+            "decided": None,
+        }
+        self.abba_state[leader_id] = st
+
+        prevote_msg = MVBAMessage(
+            msg_type=MessageType.ABBA_PREVOTE,
+            sender_id=self.node_id,
+            session_id=self.session_id,
+            protocol_id=f"abba_prev_{leader_id}",
+            data={"leader": leader_id, "bit": input_bit},
+        )
+        self._handle_abba_message(prevote_msg)
+        self.zmq_manager.broadcast_message(prevote_msg)
+        self.logger.info(f"🔄 ABBA[{leader_id}] PREVOTE({input_bit}) broadcast")
+
+    def _handle_abba_message(self, msg: MVBAMessage):
+        l = msg.data["leader"]
+        st = self.abba_state.setdefault(
+            l, {"input": 0, "prevotes": {}, "votes": {}, "decided": None}
+        )
+
+        if msg.msg_type == MessageType.ABBA_PREVOTE:
+            st["prevotes"][msg.sender_id] = msg.data["bit"]
+
+            if (
+                len(st["prevotes"]) >= self.total_nodes - self.byzantine_threshold
+                and self.node_id not in st["votes"]
+            ):
+                # Majority of prevotes
+                zeros = list(st["prevotes"].values()).count(0)
+                ones = len(st["prevotes"]) - zeros
+                bit = 1 if ones > zeros else 0
+
+                st["votes"][self.node_id] = bit
+                vote_msg = MVBAMessage(
+                    msg_type=MessageType.ABBA_VOTE,
+                    sender_id=self.node_id,
+                    session_id=self.session_id,
+                    protocol_id=f"abba_vote_{l}",
+                    data={"leader": l, "bit": bit},
+                )
+                self._handle_abba_message(vote_msg)
+                self.zmq_manager.broadcast_message(vote_msg)
+                self.logger.info(f"🔄 ABBA[{l}] VOTE({bit}) broadcast")
+
+        elif msg.msg_type == MessageType.ABBA_VOTE:
+            bit = msg.data["bit"]
+            st["votes"][msg.sender_id] = bit
+
+            # 2t+1 identical votes → decision
+            if (
+                list(st["votes"].values()).count(bit)
+                >= 2 * self.byzantine_threshold + 1
+                and st["decided"] is None
+            ):
+                st["decided"] = bit
+
+                self.logger.info(f"🏁 ABBA[{l}] DECIDE {bit}")
+                if bit == 1 and not self.mvba_decided:
+                    self._invoke_drh_and_attempt_output(l)
+
+        elif msg.msg_type == MessageType.ABBA_DECIDE:
+            pass  # (not used – local decide)
+
+    # ------------------------------------------------------------------ #
+    #                       DRh placeholder / output                     #
+    # ------------------------------------------------------------------ #
+    def _invoke_drh_and_attempt_output(self, leader_id: int):
+        """
+        Placeholder for Data-Retrieval.  Here we simply mark the protocol
+        finished and print the value that *this* process originally proposed.
+        """
+        if self.mvba_decided:
+            return
+
+        # TODO: real DRh. For now we just use our own input_value.
+        w_hat = self.input_value
+        if predicate(w_hat, self):
+            self.mvba_decided = True
+            self.logger.info(
+                f"🎉 MVBA DECIDED on value from leader {leader_id}: {w_hat}"
+            )
 
     def _handle_dr_message(self, message: MVBAMessage):
         """Handle data retrieval protocol messages"""
