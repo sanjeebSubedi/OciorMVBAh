@@ -1326,18 +1326,19 @@ class MVBANode:
 
         shares = st["Y"][commitment]  # dict {j: yj}
         try:
-            w_bytes = erasure_decode(self.total_nodes, self.byzantine_threshold, shares)
+            # FIXED: Pass the leader_id (proposer) to decode with correct Vandermonde matrix
+            w_bytes = erasure_decode(
+                self.total_nodes, self.byzantine_threshold, shares, leader_id
+            )
         except Exception as e:
             self.logger.warning(f"DRh decode error: {e}")
             return
 
-        # Re-commit and compare
-        if (
-            vc_commit(
-                erasure_encode(self.total_nodes, self.byzantine_threshold, w_bytes)
-            )
-            != commitment
-        ):
+        # Re-commit and compare (use leader's node_id for consistency)
+        expected_shards = erasure_encode(
+            self.total_nodes, self.byzantine_threshold, w_bytes, leader_id
+        )
+        if vc_commit(expected_shards) != commitment:
             self.logger.warning("DRh commitment mismatch")
             return
 
@@ -1427,8 +1428,9 @@ class MVBANode:
 
         self.sync_complete = True
         self.protocol_started = True
+        # FIXED: Pass node_id to ensure unique commitments per node
         self.shards = erasure_encode(
-            self.total_nodes, self.byzantine_threshold, self.input_value
+            self.total_nodes, self.byzantine_threshold, self.input_value, self.node_id
         )
         print("Input encoded using reed-solomon...")
         self.vc_commit = vc_commit(self.shards)

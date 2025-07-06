@@ -8,9 +8,23 @@ gf_mul = reedsolo.gf_mul
 gf_inv = reedsolo.gf_inverse
 
 
-def _vandermonde(n: int, k: int) -> List[List[int]]:
-    """n × k Vandermonde matrix over GF(256) evaluated at points 1…n"""
-    return [[pow(i, j, 257) for j in range(k)] for i in range(1, n + 1)]
+def _vandermonde(n: int, k: int, node_id: int = 0) -> List[List[int]]:
+    """n × k Vandermonde matrix with node-specific offset using proper GF(256) arithmetic"""
+    offset = node_id + 1  # ensure uniqueness
+    result = []
+    for i in range(1, n + 1):
+        row = []
+        base = (i + offset) % 256  # Keep in GF(256)
+        if base == 0:  # 0 is not a generator, use 1 instead
+            base = 1
+
+        current = 1  # base^0 = 1
+        for j in range(k):
+            row.append(current)
+            if j < k - 1:  # Don't compute one extra
+                current = gf_mul(current, base)  # Proper GF(256) multiplication
+        result.append(row)
+    return result
 
 
 def _matrix_invert_gf256(matrix: List[List[int]]) -> List[List[int]]:
@@ -65,9 +79,10 @@ def _matrix_invert_gf256(matrix: List[List[int]]) -> List[List[int]]:
 # =================================================================
 #                           public API
 # =================================================================
-def erasure_encode(n: int, t: int, value) -> List[bytes]:
+def erasure_encode(n: int, t: int, value, node_id: int = 0) -> List[bytes]:
     """
     Return *n* Reed-Solomon shares; **any** (t+1) are enough to decode.
+    Each node uses a different Vandermonde matrix to ensure unique commitments.
     """
     k = t + 1
     data = value.encode() if isinstance(value, str) else bytes(value)
@@ -77,7 +92,7 @@ def erasure_encode(n: int, t: int, value) -> List[bytes]:
         data += b"\x00" * (k - len(data) % k)
 
     blocks = [data[i : i + k] for i in range(0, len(data), k)]
-    V = _vandermonde(n, k)  # constant for (n,k)
+    V = _vandermonde(n, k, node_id)  # node-specific matrix
 
     shares = [bytearray() for _ in range(n)]
     for blk in blocks:
@@ -90,10 +105,13 @@ def erasure_encode(n: int, t: int, value) -> List[bytes]:
     return [bytes(s) for s in shares]
 
 
-def erasure_decode(n: int, t: int, shares: Dict[int, bytes]) -> bytes:
+def erasure_decode(
+    n: int, t: int, shares: Dict[int, bytes], proposer_node_id: int = 0
+) -> bytes:
     """
     Reconstruct original bytes from ≥ t+1 *indexed* shares.
     `shares` is a dict {index (0-based) → share-bytes}.
+    Must use the same node_id that was used for encoding (the proposer's ID).
     """
     k = t + 1
     if len(shares) < k:
@@ -104,7 +122,7 @@ def erasure_decode(n: int, t: int, shares: Dict[int, bytes]) -> bytes:
         raise ValueError("all shares must be equal length")
 
     idxs = sorted(shares)[:k]  # pick first k indices
-    V = _vandermonde(n, k)
+    V = _vandermonde(n, k, proposer_node_id)  # use proposer's node_id
     M = [[V[i][j] for j in range(k)] for i in idxs]  # k×k sub-matrix
     Minv = _matrix_invert_gf256(M)
 
