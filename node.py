@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from erasure_coding import erasure_encode
+from erasure_coding import erasure_decode, erasure_encode
 from predicate import predicate
 from vector_commitment import vc_commit, vc_open, vc_verify
 
@@ -321,6 +321,9 @@ class MVBANode:
         self.abba_state = {}  # key = leader l  →  dict with local data
         self.mvba_decided = False
 
+        self.dr_state: Dict[int, Dict] = {}
+        self.dr_started: set[int] = set()
+
     def initialize_state(self):
         self.acidh_locks = {}
         self.acidh_ready = {}
@@ -473,6 +476,8 @@ class MVBANode:
                 self.buffered_messages.append(message)
         elif message.msg_type in [MessageType.COIN_COMMIT, MessageType.COIN_REVEAL]:
             self._handle_coin_message(message)
+        elif message.msg_type == MessageType.ECHOSHARE:
+            self._handle_dr_message(message)
 
         # -------- ABBBA / ABBA ------------------------------------------------
         elif message.msg_type in [
@@ -524,15 +529,28 @@ class MVBANode:
             self._handle_finish_message(message)
 
     def _extract_bytes_from_string(self, shard_str: str) -> bytes:
-        """Convert string representation back to bytes"""
+        """
+        Convert the JSON-serialised shard back to bytes.
+
+        1.  First try pure-hex (the format we now transmit).
+        2.  Fall back to the two legacy `repr()` formats that appeared
+            before the switch.
+        3.  Finally treat it as a UTF-8 literal.
+        """
+        # 1. new format – plain hex
+        try:
+            return bytes.fromhex(shard_str)
+        except ValueError:
+            pass
+
+        # 2. legacy formats
         if shard_str.startswith("bytearray(b'") and shard_str.endswith("')"):
-            content = shard_str[12:-2]
-            return content.encode("latin-1")
-        elif shard_str.startswith("b'") and shard_str.endswith("'"):
-            content = shard_str[2:-1]
-            return content.encode("latin-1")
-        else:
-            return shard_str.encode("utf-8")
+            return shard_str[12:-2].encode("latin-1")
+        if shard_str.startswith("b'") and shard_str.endswith("'"):
+            return shard_str[2:-1].encode("latin-1")
+
+        # 3. last resort
+        return shard_str.encode("utf-8")
 
     def _send_vote_message(self, commitment: str):
         """Send VOTE message (Algorithm 9, line 14)"""
@@ -579,6 +597,8 @@ class MVBANode:
             # Line 13: Store share data
             if C not in self.acidh_hash:
                 self.acidh_hash[C] = j
+            else:
+                self.acidh_hash[C] = min(self.acidh_hash[C], j)
 
             self.acidh_shares[j] = (C, y, omega)
 
@@ -761,7 +781,7 @@ class MVBANode:
                 )
 
     def _send_finish_message(self, target_node_id: int, commitment: str):
-        """Alg-9 line 26: send FINISH(ID) to P_{j⋆}."""
+        """Broadcast FINISH message to all nodes (corrected from algorithm spec)."""
         finish_msg = MVBAMessage(
             msg_type=MessageType.FINISH,
             sender_id=self.node_id,
@@ -770,14 +790,13 @@ class MVBANode:
             data={"commitment": commitment},
         )
 
-        # NEW: local delivery when target == self  ↓↓↓
-        if target_node_id == self.node_id:
-            self._handle_acid_message(finish_msg)  # deliver directly
-        else:
-            self.zmq_manager.send_message(target_node_id, finish_msg)
+        # FIXED: Broadcast FINISH to all nodes instead of just the proposer
+        # This ensures all nodes can receive n-t FINISH messages to trigger ELECTION
+        self._handle_acid_message(finish_msg)  # local delivery
+        self.zmq_manager.broadcast_message(finish_msg)  # broadcast to all peers
 
         self.logger.info(
-            f"📤 Sent FINISH for commitment {commitment[:16]}... to node {target_node_id}"
+            f"📤 Sent FINISH for commitment {commitment[:16]}... to all nodes"
         )
 
     def _handle_ready_message(self, message: MVBAMessage):
@@ -1047,17 +1066,22 @@ class MVBANode:
             coin_val = int.from_bytes(hashlib.sha256(concat).digest(), "big")
             l = coin_val % self.total_nodes
 
+            # ---------- UPDATED LOGIC ----------
+            # Always start ABBBA for the final leader that the
+            # common-coin selects, even if a provisional leader was
+            # handled earlier.
             prev = self.leader_round.get(r)
-            if prev != l:  # only log if it changed
+            if prev != l:  # leader changed
                 self.leader_round[r] = l
                 self.logger.info(
                     f"🎲 [Round {r}] Common coin -> leader {l}"
                     + (" (updated)" if prev is not None else "")
                 )
+
+                if l not in self.abbba_state:  # spawn once per leader
+                    self._start_abbba_instance(l)
+
             self.coin_ready[r] = True
-            if l not in self.abbba_state:
-                self._start_abbba_instance(l)
-            # TODO: invoke ABBBA / ABBA in next step
 
     def _start_abbba_instance(self, leader_id: int):
         """
@@ -1231,30 +1255,99 @@ class MVBANode:
         elif msg.msg_type == MessageType.ABBA_DECIDE:
             pass  # (not used – local decide)
 
-    # ------------------------------------------------------------------ #
-    #                       DRh placeholder / output                     #
-    # ------------------------------------------------------------------ #
-    def _invoke_drh_and_attempt_output(self, leader_id: int):
-        """
-        Placeholder for Data-Retrieval.  Here we simply mark the protocol
-        finished and print the value that *this* process originally proposed.
-        """
-        if self.mvba_decided:
+    def _send_echoshare_message(self, leader_id: int, C: str, y: bytes, omega):
+        """Broadcast DRh ECHOSHARE"""
+        msg = MVBAMessage(
+            msg_type=MessageType.ECHOSHARE,
+            sender_id=self.node_id,
+            session_id=self.session_id,
+            protocol_id=f"dr_echoshare_{leader_id}",
+            data={
+                "leader": leader_id,
+                "commitment": C,
+                "shard": y.hex(),
+                "proof": omega,
+            },
+        )
+        self._handle_dr_message(msg)  # local delivery
+        self.logger.debug(f"Sending shard {y.hex()[:16]}…")
+        self.zmq_manager.broadcast_message(msg)
+
+    def _start_drh_instance(self, leader_id: int):
+        if hasattr(self, "dr_started") and leader_id in self.dr_started:
+            return
+        self.dr_started = getattr(self, "dr_started", set())
+        self.dr_started.add(leader_id)
+        self.dr_state.setdefault(leader_id, {"Y": {}, "done": False})
+
+        lock_ind = self.acidh_locks.get(leader_id, 0)
+        C, y, omega = self.acidh_shares.get(leader_id, (-1, -1, -1))
+        if lock_ind == 1 and C != -1:
+            self.logger.info(f"📤 DRh[{leader_id}] sending our ECHOSHARE")
+            self._send_echoshare_message(leader_id, C, y, omega)
+
+    def _handle_dr_message(self, message: MVBAMessage):
+        if message.msg_type != MessageType.ECHOSHARE:
+            return
+        l = message.data["leader"]
+        C = message.data["commitment"]
+        y = self._extract_bytes_from_string(message.data["shard"])
+        omega = message.data["proof"]
+        j = message.sender_id
+
+        # deduplicate
+        key = (l, C, j)
+        self.echoshare_seen = getattr(self, "echoshare_seen", set())
+        if key in self.echoshare_seen:
+            return
+        self.echoshare_seen.add(key)
+
+        if not vc_verify(j, C, y, omega):
             return
 
-        # TODO: real DRh. For now we just use our own input_value.
-        w_hat = self.input_value
+        leader_st = self.dr_state.setdefault(l, {"Y": {}, "done": False})
+        Ys = leader_st["Y"].setdefault(C, {})
+        Ys[j] = y
+
+        if not leader_st["done"] and len(Ys) >= self.byzantine_threshold + 1:
+            self._attempt_drh_output(l, C)
+
+    def _invoke_drh_and_attempt_output(self, leader_id: int):
+        # already decided → nothing to do
+        if self.mvba_decided:
+            return
+        # start or continue DRh for this leader
+        self._start_drh_instance(leader_id)
+
+    def _attempt_drh_output(self, leader_id: int, commitment: str):
+        st = self.dr_state[leader_id]
+        if st["done"]:
+            return
+
+        shares = st["Y"][commitment]  # dict {j: yj}
+        try:
+            w_bytes = erasure_decode(self.total_nodes, self.byzantine_threshold, shares)
+        except Exception as e:
+            self.logger.warning(f"DRh decode error: {e}")
+            return
+
+        # Re-commit and compare
+        if (
+            vc_commit(
+                erasure_encode(self.total_nodes, self.byzantine_threshold, w_bytes)
+            )
+            != commitment
+        ):
+            self.logger.warning("DRh commitment mismatch")
+            return
+
+        w_hat = w_bytes.decode("utf-8", errors="ignore")
         if predicate(w_hat, self):
+            st["done"] = True
             self.mvba_decided = True
             self.logger.info(
                 f"🎉 MVBA DECIDED on value from leader {leader_id}: {w_hat}"
             )
-
-    def _handle_dr_message(self, message: MVBAMessage):
-        """Handle data retrieval protocol messages"""
-        # Placeholder for data retrieval implementation
-        self.logger.info(f"DR: {message.msg_type.value} from node {message.sender_id}")
-        # TODO: Implement DRh protocol logic
 
     def _send_heartbeat(self):
         """Send heartbeat to all peers"""
@@ -1350,7 +1443,7 @@ class MVBANode:
                 session_id=self.session_id,
                 protocol_id="share",
                 data={
-                    "shard": str(shard),
+                    "shard": shard.hex(),
                     "commitment": self.vc_commit,
                     "proof": proof,
                     "peer_id": peer_id,
@@ -1365,7 +1458,7 @@ class MVBANode:
             session_id=self.session_id,
             protocol_id="share",
             data={
-                "shard": str(shard),
+                "shard": shard.hex(),
                 "commitment": self.vc_commit,
                 "proof": proof,
                 "peer_id": self.node_id,
