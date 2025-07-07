@@ -1116,6 +1116,9 @@ class MVBANode:
         a1 = self.acidh_ready.get(leader_id, 0)
         a2 = self.acidh_finish.get(leader_id, 0)
 
+        if TEST_FORCE_EXTRA_ROUND and self.current_round == 1:
+            a1 = a2 = 0
+
         st = {
             "a1": a1,
             "a2": a2,
@@ -1689,4 +1692,5 @@ def main():
 
 
 if __name__ == "__main__":
+    TEST_FORCE_EXTRA_ROUND = False
     sys.exit(main())
