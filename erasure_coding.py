@@ -1,66 +1,85 @@
 # rebuilt RS helper — any t+1 of n shares reconstruct
+import logging
+import pprint
 from typing import Dict, List
 
 import reedsolo
 
 # ---------- Galois-field helpers (exposed by reedsolo) ----------
+reedsolo.init_tables(0x11D)
 gf_mul = reedsolo.gf_mul
 gf_inv = reedsolo.gf_inverse
+# show the sub-matrix used for decoding even on the default log level
 
 
 def _vandermonde(n: int, k: int, node_id: int = 0) -> List[List[int]]:
-    """n × k Vandermonde matrix with node-specific offset"""
-    offset = node_id + 1  # ensure uniqueness
-    return [[pow(i + offset, j, 257) for j in range(k)] for i in range(1, n + 1)]
+    """
+    n × k Vandermonde matrix over GF(256) with a node-specific offset.
+    Row i (0-based) is evaluated at α = (i + 1 + node_id) mod 256   (α ≠ 0).
+    """
+    offset = node_id + 1
+    rows = []
+    for i in range(1, n + 1):
+        α = (i + offset) & 0xFF  # keep inside 0–255
+        if α == 0:  # 0 is not allowed – bump to 1
+            α = 1
+        row = [1]
+        for _ in range(1, k):
+            row.append(gf_mul(row[-1], α))  # next power via GF mult
+        rows.append(row)
+    return rows
 
 
 def _matrix_invert_gf256(matrix: List[List[int]]) -> List[List[int]]:
     """
     Invert a square matrix over GF(256) using Gaussian elimination.
+
+    Fixed:
+    • Only search for another pivot row when the current diagonal element is
+      actually zero.
+    • Added clearer comments.
     """
     n = len(matrix)
-    # Create augmented matrix [A | I]
+
+    # ------------------------------------------------------------------
+    # build the augmented matrix  [ A | I ]
+    # ------------------------------------------------------------------
     aug = []
     for i in range(n):
-        row = matrix[i][:] + [0] * n  # copy row and append zeros
-        row[n + i] = 1  # identity matrix
+        row = matrix[i][:] + [0] * n
+        row[n + i] = 1
         aug.append(row)
 
-    # Forward elimination
+    # ------------------------------------------------------------------
+    # forward elimination
+    # ------------------------------------------------------------------
     for i in range(n):
-        # Find pivot (non-zero element)
-        pivot_row = i
-        for j in range(i + 1, n):
-            if aug[j][i] != 0:
-                pivot_row = j
-                break
+        # make sure aug[i][i] is non-zero; swap with a lower row if needed
+        if aug[i][i] == 0:
+            for j in range(i + 1, n):
+                if aug[j][i] != 0:
+                    aug[i], aug[j] = aug[j], aug[i]
+                    break
+            else:  # ⇐ no non-zero pivot in this column
+                raise ValueError("Matrix is not invertible")
 
-        if aug[pivot_row][i] == 0:
-            raise ValueError("Matrix is not invertible")
-
-        # Swap rows if needed
-        if pivot_row != i:
-            aug[i], aug[pivot_row] = aug[pivot_row], aug[i]
-
-        # Scale row to make pivot = 1
+        # scale the pivot row so that the pivot becomes 1
         pivot = aug[i][i]
         pivot_inv = gf_inv(pivot)
         for j in range(2 * n):
             aug[i][j] = gf_mul(aug[i][j], pivot_inv)
 
-        # Eliminate column
+        # eliminate this column from the other rows
         for j in range(n):
-            if i != j and aug[j][i] != 0:
+            if j != i and aug[j][i] != 0:
                 factor = aug[j][i]
                 for k in range(2 * n):
                     aug[j][k] ^= gf_mul(factor, aug[i][k])
 
-    # Extract inverse matrix from right half
-    inverse = []
-    for i in range(n):
-        inverse.append(aug[i][n:])
-
-    return inverse
+    # ------------------------------------------------------------------
+    # extract the inverse  (right-hand side of the augmented matrix)
+    # ------------------------------------------------------------------
+    return [row[n:] for row in aug]
 
 
 # =================================================================
@@ -108,9 +127,21 @@ def erasure_decode(
     if any(len(s) != share_len for s in shares.values()):
         raise ValueError("all shares must be equal length")
 
-    idxs = sorted(shares)[:k]  # pick first k indices
-    V = _vandermonde(n, k, proposer_node_id)  # use proposer's node_id
-    M = [[V[i][j] for j in range(k)] for i in idxs]  # k×k sub-matrix
+    idxs = sorted(shares)[:k]
+    V = _vandermonde(n, k, proposer_node_id)
+    M = [[V[i][j] for j in range(k)] for i in idxs]
+
+    # --- new: always visible ---
+    import logging
+    import pprint
+
+    logging.getLogger("MVBANode").warning(
+        "DRh-decode  proposer=%d  idxs=%s  sub-matrix=\n%s",
+        proposer_node_id,
+        idxs,
+        pprint.pformat(M),
+    )
+
     Minv = _matrix_invert_gf256(M)
 
     out = bytearray()
