@@ -910,6 +910,8 @@ class MVBANode:
             self.finish_counts[commitment] = set()
 
     def _handle_election_message(self, message: MVBAMessage):
+        if self.mvba_decided:
+            return
         sender_id = message.sender_id
         commitment = message.data["commitment"]  # kept only for logging
 
@@ -945,6 +947,13 @@ class MVBANode:
         # Then broadcast to peers
         self.zmq_manager.broadcast_message(confirm_msg)
         self.logger.info(f"📤 Sent CONFIRM for commitment {commitment[:16]}...")
+        # if int(self.node_id) == 1:  # choose the victim
+        #     self.logger.warning("Simulating crash-stop right after CONFIRM")
+        #     sys.stdout.flush()
+        #     sys.stderr.flush()
+        #     import os
+
+        #     os._exit(0)
 
     def _handle_confirm_message(self, message: MVBAMessage):
         sender_id = message.sender_id
@@ -1045,43 +1054,59 @@ class MVBANode:
         r = msg.data["round"]
         s_hex = msg.data["share"]
 
-        # need matching commit
+        # ---------------- validity checks (unchanged) -----------------
         commit_dict = self.coin_commit.get(r, {})
-        if msg.sender_id not in commit_dict:
-            return  # commit not seen yet, ignore for now
-
+        if msg.sender_id not in commit_dict:  # commit missing
+            return
         H_expected = commit_dict[msg.sender_id]
         if hashlib.sha256(bytes.fromhex(s_hex)).hexdigest() != H_expected:
-            return  # invalid reveal
+            return  # bad reveal
 
+        # store the reveal
         self.coin_reveal.setdefault(r, {})[msg.sender_id] = s_hex
 
-        threshold = self.total_nodes - self.byzantine_threshold
-        if len(self.coin_reveal[r]) >= threshold:  # ≥ n−t reveals
-            # deterministic ordering → identical hash everywhere
-            sorted_ids = sorted(self.coin_reveal[r])
-            concat = b"".join(
-                bytes.fromhex(self.coin_reveal[r][sid]) for sid in sorted_ids
+        # --------------- NEW   deterministic-subset rule ---------------
+        #
+        # Step-1  – choose the *canonical* set of n-t node-IDs:
+        #           take the lexicographically-smallest n-t IDs **among the
+        #           nodes that have already sent a COMMIT**.  This set is
+        #           identical at every correct process because every correct
+        #           process eventually receives the same COMMIT multiset.
+        #
+        # Step-2  – do *not* compute the coin until we have REVEALs from
+        #           *every* node in that canonical set.  Hence all correct
+        #           processes will hash the same byte-string and obtain the
+        #           same leader on their *first* attempt.
+        #
+        threshold = self.total_nodes - self.byzantine_threshold  # n − t
+        commit_ids = sorted(commit_dict)  # IDs with COMMIT
+        if len(commit_ids) < threshold:
+            return  # not enough commits
+
+        canonical = commit_ids[:threshold]  # fixed subset
+
+        # wait until each canonical ID has revealed
+        if any(i not in self.coin_reveal[r] for i in canonical):
+            return
+
+        # ----------------------------------------------------------------
+        # All REVEALs from the canonical subset are present – derive coin.
+        concat = b"".join(bytes.fromhex(self.coin_reveal[r][sid]) for sid in canonical)
+        coin_val = int.from_bytes(hashlib.sha256(concat).digest(), "big")
+        l = coin_val % self.total_nodes
+
+        # ---------- remainder identical to previous version -------------
+        prev = self.leader_round.get(r)
+        if prev != l:  # first time or changed
+            self.leader_round[r] = l
+            self.logger.info(
+                f"🎲 [Round {r}] Common coin -> leader {l}"
+                + (" (updated)" if prev is not None else "")
             )
-            coin_val = int.from_bytes(hashlib.sha256(concat).digest(), "big")
-            l = coin_val % self.total_nodes
+            if l not in self.abbba_state:  # spawn once per leader
+                self._start_abbba_instance(l)
 
-            # ---------- UPDATED LOGIC ----------
-            # Always start ABBBA for the final leader that the
-            # common-coin selects, even if a provisional leader was
-            # handled earlier.
-            prev = self.leader_round.get(r)
-            if prev != l:  # leader changed
-                self.leader_round[r] = l
-                self.logger.info(
-                    f"🎲 [Round {r}] Common coin -> leader {l}"
-                    + (" (updated)" if prev is not None else "")
-                )
-
-                if l not in self.abbba_state:  # spawn once per leader
-                    self._start_abbba_instance(l)
-
-            self.coin_ready[r] = True
+        self.coin_ready[r] = True
 
     def _start_abbba_instance(self, leader_id: int):
         """
@@ -1206,6 +1231,58 @@ class MVBANode:
         self.zmq_manager.broadcast_message(prevote_msg)
         self.logger.info(f"🔄 ABBA[{leader_id}] PREVOTE({input_bit}) broadcast")
 
+    def _maybe_finish_round(self) -> None:
+        """
+        Called after every ABBA decision.
+        If  (i)  the common-coin has produced ≥1 leaders this round   AND
+            (ii) every such leader’s ABBA has a decision               AND
+            (iii) all those decisions are 0
+        then we advance to round r+1.
+        """
+        r = self.current_round
+        if not self.coin_ready.get(r):
+            return  # coin not finished yet
+
+        leaders = {self.leader_round[r]}  # first coin value
+        # In our implementation the leader can change once (updated) so track both
+        leaders.update(l for rr, l in self.leader_round.items() if rr == r)
+
+        # abort if any leader not decided yet
+        if any(self.abba_state.get(l, {}).get("decided") is None for l in leaders):
+            return
+
+        # if any ABBA decided 1 the DRh path will finish MVBA – nothing to do
+        if any(self.abba_state[l]["decided"] == 1 for l in leaders):
+            return  # round already successful
+
+        # otherwise every decision is 0  ➜  start next round
+        self.logger.info(
+            f"🔄 Round {r} complete – all ABBA decided 0; moving to round {r + 1}"
+        )
+        self._start_next_round()
+
+    def _start_next_round(self) -> None:
+        """Reset round-local state and bootstrap the next Election/Coin."""
+        self.current_round += 1
+        r = self.current_round
+
+        # clear / re-initialise round-scoped variables
+        self.election_started = False
+        self.confirm_already_sent = False
+        self.election_senders = set()
+        self.confirm_senders = set()
+        self.coin_commit[r] = {}
+        self.coin_reveal[r] = {}
+        self.coin_ready[r] = False
+
+        self.abba_state = {}
+        self.abbba_state = {}
+
+        # (keep abbba_state / abba_state dictionaries; entries are keyed by leader id)
+
+        # kick off the new round immediately
+        self._start_election_round()
+
     def _handle_abba_message(self, msg: MVBAMessage):
         l = msg.data["leader"]
         st = self.abba_state.setdefault(
@@ -1252,6 +1329,8 @@ class MVBANode:
                 if bit == 1 and not self.mvba_decided:
                     self._invoke_drh_and_attempt_output(l)
 
+                self._maybe_finish_round()
+
         elif msg.msg_type == MessageType.ABBA_DECIDE:
             pass  # (not used – local decide)
 
@@ -1267,8 +1346,10 @@ class MVBANode:
                 "commitment": C,
                 "shard": y.hex(),
                 "proof": omega,
+                "index": self.node_id,
             },
         )
+        self.logger.debug(f"DBG-ECHOSHARE  send  l={leader_id}  idx={self.node_id}")
         self._handle_dr_message(msg)  # local delivery
         self.logger.debug(f"Sending shard {y.hex()[:16]}…")
         self.zmq_manager.broadcast_message(msg)
@@ -1293,23 +1374,30 @@ class MVBANode:
         C = message.data["commitment"]
         y = self._extract_bytes_from_string(message.data["shard"])
         omega = message.data["proof"]
-        j = message.sender_id
+        idx = message.data.get("index", message.sender_id)
+        self.logger.debug(
+            f"DBG-ECHOSHARE  recv  l={l}  from={message.sender_id}  idx={idx}"
+        )
 
         # deduplicate
-        key = (l, C, j)
+        key = (l, C, idx)
+
         self.echoshare_seen = getattr(self, "echoshare_seen", set())
         if key in self.echoshare_seen:
             return
         self.echoshare_seen.add(key)
 
-        if not vc_verify(j, C, y, omega):
+        if not vc_verify(idx, C, y, omega):
             return
 
         leader_st = self.dr_state.setdefault(l, {"Y": {}, "done": False})
         Ys = leader_st["Y"].setdefault(C, {})
-        Ys[j] = y
+        Ys[idx] = y
+        self.logger.debug(
+            f"DBG-DRh       stored l={l}  indices={sorted(Ys)}  " f"count={len(Ys)}"
+        )
 
-        if not leader_st["done"] and len(Ys) >= self.byzantine_threshold + 1:
+        if not leader_st["done"]:
             self._attempt_drh_output(l, C)
 
     def _invoke_drh_and_attempt_output(self, leader_id: int):
@@ -1325,6 +1413,15 @@ class MVBANode:
             return
 
         shares = st["Y"][commitment]  # dict {j: yj}
+        k = self.byzantine_threshold + 1
+
+        if len(shares) < k:
+            return
+
+        self.logger.warning(
+            f"DBG-DRh  trying decode l={leader_id}  " f"indices={sorted(shares)[:k]}"
+        )
+
         try:
             # FIXED: Pass the leader_id (proposer) to decode with correct Vandermonde matrix
             w_bytes = erasure_decode(
