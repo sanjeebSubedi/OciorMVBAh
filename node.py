@@ -21,12 +21,17 @@ import socket
 import sys
 import threading
 import time
-from dataclasses import dataclass
-from enum import Enum
+
+# TEMP: keep old imports
+from dataclasses import dataclass as _dataclass
+from enum import Enum as _Enum
 from typing import Any, Dict, List, Optional
 
 from erasure_coding import erasure_decode, erasure_encode
 from predicate import predicate
+
+# New, canonical message definitions
+from protocol.common.message import MessageType, MVBAMessage
 from vector_commitment import vc_commit, vc_open, vc_verify
 
 # ZeroMQ imports
@@ -36,13 +41,15 @@ except ImportError:
     print("ERROR: ZeroMQ not installed. Install with: pip install pyzmq")
     sys.exit(1)
 
+from core.router import MessageRouter
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 
 
-class MessageType(Enum):
+class MessageType(_Enum):
     """MVBA Protocol message types"""
 
     # ACIDh protocol messages
@@ -76,7 +83,7 @@ class MessageType(Enum):
     ABBA_DECIDE = "ABBA_DECIDE"
 
 
-@dataclass
+@_dataclass
 class MVBAMessage:
     """Structured message for MVBA protocol"""
 
@@ -116,7 +123,8 @@ class MVBAMessage:
         )
 
 
-class ZeroMQManager:
+# Legacy definition kept for now (will be deleted in later refactor)
+class _LegacyZeroMQManager:
     """Manages ZeroMQ connections for P2P communication"""
 
     def __init__(self, node_id: int, my_port: int, peers: List[Dict]):
@@ -282,7 +290,7 @@ class MVBANode:
         self.peers: List[Dict] = []
 
         # ZeroMQ manager
-        self.zmq_manager: Optional[ZeroMQManager] = None
+        self.zmq_manager: Optional[_LegacyZeroMQManager] = None
 
         # Protocol state
         self.running = False
@@ -299,6 +307,14 @@ class MVBANode:
         }
 
         self.logger = logging.getLogger("MVBANode")
+
+        # Message routing
+        self.router = MessageRouter(self.logger)
+        # Protocol sub-handlers
+        from protocol.acid.handler import ACIDHandler  # local import to avoid cycles
+
+        self.acid_handler = ACIDHandler(self)
+        self._register_router_handlers()
 
         # Setup signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -411,7 +427,7 @@ class MVBANode:
         self.logger.info(f"Session ID: {self.session_id}")
 
         # Set up ZeroMQ manager
-        self.zmq_manager = ZeroMQManager(self.node_id, my_port, self.peers)
+        self.zmq_manager = _LegacyZeroMQManager(self.node_id, my_port, self.peers)
 
     def setup_p2p_communication(self) -> bool:
         """Set up peer-to-peer communication"""
@@ -426,7 +442,7 @@ class MVBANode:
             return False
 
         # Start message handling
-        self.zmq_manager.start_message_loop(self._handle_message)
+        self.zmq_manager.start_message_loop(self.router.dispatch)
 
         # Send heartbeat to all peers
         self._send_heartbeat()
@@ -947,7 +963,7 @@ class MVBANode:
         # Then broadcast to peers
         self.zmq_manager.broadcast_message(confirm_msg)
         self.logger.info(f"📤 Sent CONFIRM for commitment {commitment[:16]}...")
-        # if int(self.node_id) == 1:  # choose the victim
+        # if int(self.node_id) == 1:
         #     self.logger.warning("Simulating crash-stop right after CONFIRM")
         #     sys.stdout.flush()
         #     sys.stderr.flush()
@@ -1640,6 +1656,78 @@ class MVBANode:
             self.zmq_manager.stop()
 
         self.logger.info("Node stopped")
+
+    # ------------------------------------------------------------------
+    # Router wiring (introduced during refactor)
+    # ------------------------------------------------------------------
+    def _register_router_handlers(self):
+        """Register message-type → handler mapping so the MessageRouter can
+        dispatch inbound packets directly to the correct local function.
+
+        This keeps the network layer oblivious of protocol details and removes
+        the huge if/elif chain that previously lived in `_handle_message`.
+        """
+
+        r = self.router
+
+        # --- infrastructure ------------------------------------------------
+        r.register(MessageType.HEARTBEAT, self._handle_heartbeat)
+        r.register(MessageType.INPUT_READY, self._handle_input_ready)
+
+        # --- ACIDh ---------------------------------------------------------
+        r.register_many(
+            [
+                MessageType.SHARE,
+                MessageType.VOTE,
+                MessageType.LOCK,
+                MessageType.READY,
+                MessageType.FINISH,
+            ],
+            self.acid_handler.handle,
+        )
+
+        # --- Election / common-coin ---------------------------------------
+        r.register(MessageType.ELECTION, self._handle_election_message)
+        r.register(MessageType.CONFIRM, self._handle_confirm_message)
+        r.register_many(
+            [MessageType.COIN_COMMIT, MessageType.COIN_REVEAL],
+            self._handle_coin_message,
+        )
+
+        # --- ABBBA / ABBA ---------------------------------------------------
+        r.register_many(
+            [
+                MessageType.ABBBA_PREVOTE,
+                MessageType.ABBBA_VOTE,
+                MessageType.ABBBA_DECIDE,
+            ],
+            self._handle_abbba_message,
+        )
+        r.register_many(
+            [
+                MessageType.ABBA_PREVOTE,
+                MessageType.ABBA_VOTE,
+                MessageType.ABBA_DECIDE,
+            ],
+            self._handle_abba_message,
+        )
+
+        # --- DRh -----------------------------------------------------------
+        r.register(MessageType.ECHOSHARE, self._handle_dr_message)
+
+        # Shutdown, etc. could be added here later.
+
+    # ---------------------------------------------------------------
+    # Wrapper that preserves the pre-synchronisation buffering logic.
+    # ---------------------------------------------------------------
+    def _route_acid_message(self, msg: MVBAMessage):
+        """Either buffer the message (if sync not complete) or deliver it."""
+        if self.sync_complete:
+            self._handle_acid_message(msg)
+        else:
+            if not hasattr(self, "buffered_messages"):
+                self.buffered_messages = []
+            self.buffered_messages.append(msg)
 
 
 def main():
