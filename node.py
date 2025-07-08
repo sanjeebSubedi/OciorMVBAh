@@ -45,7 +45,7 @@ from core.router import MessageRouter
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 
 
@@ -1129,8 +1129,27 @@ class MVBANode:
         Spawn ABBBA(ID, leader_id) with inputs
             a1 = Rready[leader_id] ,  a2 = Ffinish[leader_id]
         """
-        a1 = self.acidh_ready.get(leader_id, 0)
-        a2 = self.acidh_finish.get(leader_id, 0)
+        # Fetch latest flags directly from the ACIDʰ state machine (authoritative)
+        acid_state = None
+        if hasattr(self, "acid_handler") and getattr(self.acid_handler, "_state", None):
+            acid_state = self.acid_handler._state  # type: ignore[attr-defined]
+            a1 = acid_state.acidh_ready.get(leader_id, 0)
+            a2 = acid_state.acidh_finish.get(leader_id, 0)
+        else:
+            a1 = self.acidh_ready.get(leader_id, 0)
+            a2 = self.acidh_finish.get(leader_id, 0)
+
+        # Debug: dump readiness/finish flags for tracing extra-round issue
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(
+                "ABBBA start r=%s leader=%s a1=%s a2=%s | state_ready=%s state_finish=%s",
+                self.current_round,
+                leader_id,
+                a1,
+                a2,
+                (acid_state.acidh_ready.get(leader_id) if acid_state else "n/a"),
+                (acid_state.acidh_finish.get(leader_id) if acid_state else "n/a"),
+            )
 
         if TEST_FORCE_EXTRA_ROUND and self.current_round == 1:
             a1 = a2 = 0
@@ -1296,6 +1315,9 @@ class MVBANode:
 
         self.abba_state = {}
         self.abbba_state = {}
+
+        self.dr_state = {}
+        self.dr_started.clear()
 
         # (keep abbba_state / abba_state dictionaries; entries are keyed by leader id)
 
@@ -1582,8 +1604,8 @@ class MVBANode:
                 "peer_id": self.node_id,
             },
         )
-        # Process self-SHARE immediately
-        self._handle_acid_message(self_message)
+        # Process our own SHARE through the new ACID handler/state machine
+        self.acid_handler.handle(self_message)
         print(f"[Node {self.node_id}] 📤 Sent SHARE messages to all peers")
 
         if hasattr(self, "buffered_messages") and self.buffered_messages:
@@ -1618,7 +1640,7 @@ class MVBANode:
                     MessageType.READY,
                     MessageType.FINISH,
                 ]:
-                    self._handle_acid_message(msg)
+                    self.acid_handler.handle(msg)
                 elif msg.msg_type in [MessageType.ELECTION, MessageType.CONFIRM]:
                     self._handle_election_message(msg)
                 elif msg.msg_type == MessageType.ECHOSHARE:
@@ -1723,7 +1745,7 @@ class MVBANode:
     def _route_acid_message(self, msg: MVBAMessage):
         """Either buffer the message (if sync not complete) or deliver it."""
         if self.sync_complete:
-            self._handle_acid_message(msg)
+            self.acid_handler.handle(msg)
         else:
             if not hasattr(self, "buffered_messages"):
                 self.buffered_messages = []
@@ -1780,5 +1802,5 @@ def main():
 
 
 if __name__ == "__main__":
-    TEST_FORCE_EXTRA_ROUND = False
+    TEST_FORCE_EXTRA_ROUND = True
     sys.exit(main())
