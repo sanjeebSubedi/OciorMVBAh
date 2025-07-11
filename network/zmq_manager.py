@@ -11,7 +11,7 @@ from typing import Dict, List
 
 import zmq
 
-from protocol.common.message import MVBAMessage
+from protocol.common.message import MessageType, MVBAMessage
 
 __all__ = ["ZeroMQManager"]
 
@@ -92,7 +92,9 @@ class ZeroMQManager:
                     return False
                 target_node_id = alt
             self.dealer_sockets[target_node_id].send_string(msg.to_json())
-            self.logger.debug("Sent %s to node %s", msg.msg_type, target_node_id)
+            # Only log protocol messages, not heartbeats or routine traffic
+            if msg.msg_type != MessageType.HEARTBEAT:
+                self.logger.debug("Sent %s to node %s", msg.msg_type, target_node_id)
             return True
         except Exception as exc:
             self.logger.error("Error sending to node %s: %s", target_node_id, exc)
@@ -102,7 +104,9 @@ class ZeroMQManager:
         ok = 0
         for pid in self.dealer_sockets:
             ok += self.send_message(pid, msg)
-        self.logger.debug("Broadcast %s to %d peers", msg.msg_type, ok)
+        # Only log protocol messages, not heartbeats
+        if msg.msg_type != MessageType.HEARTBEAT:
+            self.logger.debug("Broadcast %s to %d peers", msg.msg_type, ok)
         return ok
 
     # ------------------------------------------------------------------
