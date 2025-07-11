@@ -16,8 +16,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Set, Tuple
 
+from crypto import vc_verify
 from protocol.common.message import MessageType, MVBAMessage
-from vector_commitment import vc_verify
 
 __all__ = ["Outbound", "ACIDState"]
 
@@ -64,7 +64,7 @@ class ACIDState:
 
         # ---------------- persistent per-instance state ----------------
 
-        # Sets and maps initialised exactly like in the legacy Node
+        # Protocol state tracking structures
         self.acidh_locks: Dict[int, int] = {}
         self.acidh_ready: Dict[int, int] = {}
         self.acidh_finish: Dict[int, int] = {}
@@ -72,8 +72,7 @@ class ACIDState:
         self.acidh_hash: Dict[str, int] = {}
         self.received_shares: Set[Tuple[int, int, str]] = set()
 
-        # Lazy-initialised on first use in the legacy code – we allocate
-        # them eagerly here for simplicity.
+        # Initialize state for all nodes (eager initialization for clarity)
         self.vote_counts: Dict[str, Set[int]] = {}
         self.lock_counts: Dict[str, Set[int]] = {}
         self.ready_counts: Dict[str, Set[int]] = {}
@@ -119,7 +118,7 @@ class ACIDState:
         except ValueError:
             pass
 
-        # 2. legacy formats
+        # 2. backward compatibility formats
         if shard_str.startswith("bytearray(b'") and shard_str.endswith("')"):
             return shard_str[12:-2].encode("latin-1")
         if shard_str.startswith("b'") and shard_str.endswith("'"):
@@ -173,8 +172,7 @@ class ACIDState:
             protocol_id="finish",
             data={"commitment": commitment},
         )
-        # We follow the *fixed* behaviour of the legacy code and broadcast
-        # FINISH to **all** peers (instead of only the proposer).
+        # Broadcast FINISH to all peers (per protocol specification)
         self.log.info("📤 FINISH for commitment %s…", commitment[:16])
         # Update local state immediately – ensures symmetric view.
         self._handle_finish(finish)
